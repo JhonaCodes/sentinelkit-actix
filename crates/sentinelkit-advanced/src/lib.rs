@@ -2,6 +2,8 @@ use actix_web::body::EitherBody;
 use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready};
 use actix_web::{Error, ResponseError};
 use futures_util::future::{LocalBoxFuture, Ready, ok};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use serde::Deserialize;
 use sentinelkit_contract::AppError;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -24,6 +26,29 @@ pub trait HardwareKeyVerifier: Send + Sync + 'static {
 
 pub trait EnclaveVerifier: Send + Sync + 'static {
     fn verify(&self, req: &ServiceRequest) -> bool;
+}
+
+#[derive(Debug, Clone)]
+pub struct JwtHs256AttestationConfig {
+    pub secret: String,
+    pub issuer: String,
+    pub audience: String,
+    pub required_integrity: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AttestationClaims {
+    #[serde(rename = "exp")]
+    _exp: usize,
+    #[allow(dead_code)]
+    iat: Option<usize>,
+    #[serde(rename = "iss")]
+    _iss: String,
+    #[serde(rename = "aud")]
+    _aud: serde_json::Value,
+    #[allow(dead_code)]
+    device_id: Option<String>,
+    integrity: Option<String>,
 }
 
 fn request_id(req: &ServiceRequest) -> String {
@@ -184,6 +209,53 @@ impl AttestationVerifier for HeaderAttestationVerifier {
             .and_then(|h| h.to_str().ok())
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false)
+    }
+}
+
+pub struct JwtHs256AttestationVerifier {
+    cfg: JwtHs256AttestationConfig,
+}
+
+impl JwtHs256AttestationVerifier {
+    pub fn new(cfg: JwtHs256AttestationConfig) -> Self {
+        Self { cfg }
+    }
+}
+
+impl AttestationVerifier for JwtHs256AttestationVerifier {
+    fn verify(&self, req: &ServiceRequest) -> bool {
+        let token = match req
+            .headers()
+            .get("x-aula-attestation")
+            .and_then(|h| h.to_str().ok())
+        {
+            Some(v) if !v.trim().is_empty() => v,
+            _ => return false,
+        };
+
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_issuer(&[self.cfg.issuer.as_str()]);
+        validation.set_audience(&[self.cfg.audience.as_str()]);
+        validation.validate_exp = true;
+
+        let data = match decode::<AttestationClaims>(
+            token,
+            &DecodingKey::from_secret(self.cfg.secret.as_bytes()),
+            &validation,
+        ) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        if let Some(required) = &self.cfg.required_integrity {
+            return data
+                .claims
+                .integrity
+                .as_ref()
+                .map(|v| v == required)
+                .unwrap_or(false);
+        }
+        true
     }
 }
 

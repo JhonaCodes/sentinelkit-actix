@@ -46,6 +46,240 @@ sentinelkit-actix = {
 }
 ```
 
+## Configuracion centralizada (`init` en `main`)
+
+No necesitas \"millones de env vars\". Puedes configurar todo en un solo objeto:
+
+```rust
+use sentinelkit_actix::SentinelKitInit;
+
+let init = SentinelKitInit::from_config(
+    SentinelKitInit::builder()
+        .local_redis()           // usa redis://127.0.0.1:6379
+        .advanced_all(true)      // JWE/CBT/Attestation/HBK/Enclave
+        .etag(true)
+        .rate_limit_normalization(true)
+        .build(),
+);
+```
+
+Presets:
+
+```rust
+let dev = SentinelKitInit::default_dev();                  // in-memory
+let prod = SentinelKitInit::default_prod_local_redis();    // redis local + advanced on
+```
+
+## Managed verifiers (sin `impl` manual)
+
+Si no quieres implementar traits de verificación, usa configuración managed:
+
+```rust
+use sentinelkit_actix::*;
+
+let managed = ManagedSecurityConfig::default()
+    .with_auth_jwt_hs256(JwtHs256Config {
+        secret: "dev-secret".to_string(),
+        issuer: "aula-issuer".to_string(),
+        audience: "aula-api".to_string(),
+    })
+    .with_signing_hmac(HmacSigningConfig {
+        secret: "signing-secret".to_string(),
+        timestamp_window_secs: 300,
+    })
+    .with_anti_replay(AntiReplayConfig::default())
+    .with_anti_replay_redis("redis://127.0.0.1:6379")
+    .with_attestation_jwt_hs256(JwtHs256AttestationConfig {
+        secret: "attestation-secret".to_string(),
+        issuer: "attestation-issuer".to_string(),
+        audience: "aula-api".to_string(),
+        required_integrity: Some("MEETS_STRONG_INTEGRITY".to_string()),
+    });
+
+let verifiers = managed_verifiers(managed).expect("managed verifiers");
+```
+
+Esto te da:
+
+- `auth` con JWT HS256
+- `signer` con HMAC de request (`method + path + timestamp`)
+- `anti_replay` en Redis (o memoria si omites redis)
+- `attestation` con JWT HS256
+- fallback allow-all en módulos no configurados
+
+## Bootstrap recomendado en `main`
+
+```rust
+use actix_web::{App, HttpServer};
+use sentinelkit_actix::*;
+
+let init = SentinelKitInit::default_prod_local_redis();
+let verifiers = SentinelKitVerifiers::default(); // reemplaza por tus verificadores reales
+
+HttpServer::new(move || {
+    let mut app = App::new()
+        .wrap(context())
+        .wrap(security_headers(init.cfg.headers_policy.clone()))
+        .wrap(authn(verifiers.auth.clone()))
+        .wrap(authz(verifiers.authz.clone()))
+        .wrap(request_signing(verifiers.signer.clone()))
+        .wrap(anti_replay(verifiers.anti_replay.clone()));
+
+    if init.cfg.enable_jwe {
+        app = app.wrap(jwe(verifiers.jwe.clone()));
+    }
+    if init.cfg.enable_cbt {
+        app = app.wrap(cbt(verifiers.cbt.clone()));
+    }
+    if init.cfg.enable_attestation {
+        app = app.wrap(attestation(verifiers.attestation.clone()));
+    }
+    if init.cfg.enable_hardware_keys {
+        app = app.wrap(hardware_keys(verifiers.hardware_keys.clone()));
+    }
+    if init.cfg.enable_enclave {
+        app = app.wrap(enclave(verifiers.enclave.clone()));
+    }
+    if init.cfg.enable_etag {
+        app = app.wrap(etag());
+    }
+    if init.cfg.enable_rate_limit_normalization {
+        app = app.wrap(normalize_rate_limit_errors());
+    }
+
+    app
+})
+```
+
+## Configuración completa por modo
+
+### Modo A: Solo memoria (rápido para dev)
+
+Cuándo usar:
+
+- desarrollo local
+- una sola instancia del backend
+- no necesitas estado compartido entre réplicas
+
+Config:
+
+```rust
+use sentinelkit_actix::*;
+
+let init = SentinelKitInit::from_config(
+    SentinelKitInit::builder()
+        .in_memory_state()
+        .advanced_all(true)          // o false si no quieres módulos avanzados
+        .etag(true)
+        .rate_limit_normalization(true)
+        .build(),
+);
+
+let verifiers = SentinelKitVerifiers::default();
+```
+
+Limitación:
+
+- si reinicias la app, estado de nonce/idempotency/replay se pierde
+- no sirve bien para múltiples instancias
+
+### Modo B: Redis (recomendado para beta/prod)
+
+Cuándo usar:
+
+- múltiples instancias
+- necesitas estado compartido de seguridad
+- quieres control más robusto de anti-replay/idempotency/rate-state
+
+#### 1) Levantar Redis en tu VM (sin cuenta cloud)
+
+Opción Docker:
+
+```bash
+docker run -d --name redis-local -p 6379:6379 redis:7
+```
+
+#### 2) Configurar sentinelkit con Redis
+
+```rust
+use sentinelkit_actix::*;
+
+let init = SentinelKitInit::from_config(
+    SentinelKitInit::builder()
+        .redis_state("redis://127.0.0.1:6379")
+        // también existe: .local_redis()
+        .advanced_all(true)
+        .etag(true)
+        .rate_limit_normalization(true)
+        .build(),
+);
+
+let verifiers = SentinelKitVerifiers::default();
+```
+
+#### 3) Aplicar pipeline completo en `main`
+
+```rust
+use actix_web::{App, HttpServer};
+use sentinelkit_actix::*;
+
+let init = SentinelKitInit::builder()
+    .redis_state("redis://127.0.0.1:6379")
+    .advanced_all(true)
+    .etag(true)
+    .rate_limit_normalization(true)
+    .build();
+
+let init = SentinelKitInit::from_config(init);
+let verifiers = managed_verifiers(
+    ManagedSecurityConfig::default()
+        .with_auth_jwt_hs256(JwtHs256Config {
+            secret: "dev-secret".to_string(),
+            issuer: "aula-issuer".to_string(),
+            audience: "aula-api".to_string(),
+        })
+        .with_signing_hmac(HmacSigningConfig {
+            secret: "signing-secret".to_string(),
+            timestamp_window_secs: 300,
+        })
+        .with_anti_replay(AntiReplayConfig::default())
+).expect("managed verifiers");
+
+HttpServer::new(move || {
+    let mut app = App::new()
+        .wrap(context())
+        .wrap(security_headers(init.cfg.headers_policy.clone()))
+        .wrap(authn(verifiers.auth.clone()))
+        .wrap(authz(verifiers.authz.clone()))
+        .wrap(request_signing(verifiers.signer.clone()))
+        .wrap(anti_replay(verifiers.anti_replay.clone()));
+
+    if init.cfg.enable_jwe {
+        app = app.wrap(jwe(verifiers.jwe.clone()));
+    }
+    if init.cfg.enable_cbt {
+        app = app.wrap(cbt(verifiers.cbt.clone()));
+    }
+    if init.cfg.enable_attestation {
+        app = app.wrap(attestation(verifiers.attestation.clone()));
+    }
+    if init.cfg.enable_hardware_keys {
+        app = app.wrap(hardware_keys(verifiers.hardware_keys.clone()));
+    }
+    if init.cfg.enable_enclave {
+        app = app.wrap(enclave(verifiers.enclave.clone()));
+    }
+    if init.cfg.enable_etag {
+        app = app.wrap(etag());
+    }
+    if init.cfg.enable_rate_limit_normalization {
+        app = app.wrap(normalize_rate_limit_errors());
+    }
+
+    app
+})
+```
+
 ## 1) Respuestas (formas de uso)
 
 ### A. Forma directa con `Response::*` (recomendada)
@@ -76,6 +310,38 @@ let res = Response::ok_paginated_with(
     42,  // total_items
     ResponseContext { request_id: "req_2", path: "/v1/hotels" },
 );
+```
+
+### B2. Paginación segura desde query (`?page=&page_size=&sort=`)
+
+```rust
+use actix_web::{web::Query, HttpResponse};
+use sentinelkit_actix::{
+    AppError, PaginationConfig, PaginationQuery, Response, ResponseContext,
+    SentinelContext, normalize_pagination_query,
+};
+
+async fn list_hotels(ctx: SentinelContext, q: Query<PaginationQuery>) -> Result<HttpResponse, AppError> {
+    let pg = normalize_pagination_query(
+        q.into_inner(),
+        PaginationConfig::default(),
+        &["created_at_desc", "name_asc"],
+    )?;
+
+    // usa pg.page, pg.page_size, pg.offset, pg.sort en tu repo/DB
+    let hotels = vec![serde_json::json!({"id":"htl_1","name":"Hotel Aurora"})];
+
+    Ok(Response::ok_paginated_with(
+        hotels,
+        pg.page,
+        pg.page_size,
+        42,
+        ResponseContext {
+            request_id: ctx.request_id(),
+            path: ctx.path(),
+        },
+    ))
+}
 ```
 
 ### C. Forma fluida sobre `Result<T, AppError>`
@@ -132,17 +398,25 @@ let err = AppError::custom("HOTEL_NOT_AVAILABLE")
 ## 3) Contexto de request
 
 ```rust
-use actix_web::{App, HttpRequest, HttpResponse, web};
-use sentinelkit_actix::{context, read_request_context};
+use actix_web::{web, App, HttpResponse};
+use sentinelkit_actix::{context, SentinelContext};
 
-async fn handler(req: HttpRequest) -> HttpResponse {
-    let ctx = read_request_context(&req).expect("context");
+#[derive(Clone)]
+struct AppStateService {
+    app_name: String,
+}
+
+async fn handler(ctx: SentinelContext, state: web::Data<AppStateService>) -> HttpResponse {
     HttpResponse::Ok()
-        .insert_header(("x-debug-request-id", ctx.request_id))
+        .insert_header(("x-debug-request-id", ctx.request_id()))
+        .insert_header(("x-app-name", state.app_name.clone()))
         .finish()
 }
 
 let app = App::new()
+    .app_data(web::Data::new(AppStateService {
+        app_name: "hotel-api".to_string(),
+    }))
     .wrap(context())
     .route("/v1/x", web::get().to(handler));
 ```
@@ -355,4 +629,228 @@ Con `rate-limiter-backend`:
 
 ```bash
 cargo test -p sentinelkit-actix --features rate-limiter-backend
+```
+
+Ejemplo ejecutable de referencia (managed config + Actix):
+
+```bash
+cargo run -p sentinelkit-actix --example managed_main --features rate-limiter-backend
+```
+
+## 11) Variables de entorno (opcionales)
+
+La libreria funciona sin env vars obligatorias.
+Si quieres, puedes usar env vars para no hardcodear config.
+
+Ejemplo opcional:
+
+```bash
+# Base API
+export API_BASE_URL="http://127.0.0.1:8080"
+
+# Authn (JWT/OAuth)
+export AUTH_ISSUER="https://issuer.example.com"
+export AUTH_AUDIENCE="api://my-service"
+export AUTH_JWKS_URL="https://issuer.example.com/.well-known/jwks.json"
+
+# Request signing
+export SIGNING_HMAC_SECRET="replace-me"
+
+# Anti-replay
+export ANTI_REPLAY_WINDOW_SECS="300"
+export REDIS_URL="redis://127.0.0.1:6379"
+
+# Advanced controls
+export REQUIRE_JWE="true"
+export REQUIRE_CBT="true"
+export REQUIRE_ATTESTATION="true"
+export REQUIRE_HBK="true"
+export REQUIRE_ENCLAVE="true"
+
+# Rate limiter (si usas provider real)
+export RATE_LIMIT_ENABLED="true"
+```
+
+Notas:
+
+- Si no quieres env vars, usa `SentinelKitInit::builder()` y valores directos.
+- `REDIS_URL` no requiere cuenta cloud; puede ser Redis local (`redis://127.0.0.1:6379`).
+- En `dev` puedes quedarte en `InMemory` (`default_dev()`).
+
+## 12) Ejemplos de requests HTTP (curl)
+
+### A. Health basico (solo contexto)
+
+```bash
+curl -i "$API_BASE_URL/v1/health"
+```
+
+Esperado:
+
+- status `200`
+- header `x-request-id`
+
+### B. Endpoint con Authn (Bearer)
+
+```bash
+curl -i "$API_BASE_URL/v1/hotels" \
+  -H "Authorization: Bearer <access_token>"
+```
+
+Sin token valido: `401` estandarizado.
+
+### C. Endpoint con request signing (HMAC/JWS hook)
+
+```bash
+curl -i "$API_BASE_URL/v1/hotels" \
+  -H "Authorization: Bearer <access_token>" \
+  -H "X-Aula-Signature: <signature>" \
+  -H "X-Aula-Alg: HMAC-SHA256"
+```
+
+Sin firma valida: `401` estandarizado.
+
+### D. Endpoint con anti-replay
+
+```bash
+curl -i "$API_BASE_URL/v1/hotels" \
+  -H "Authorization: Bearer <access_token>" \
+  -H "X-Aula-Nonce: nonce-123" \
+  -H "X-Aula-Timestamp: 2026-02-26T21:30:00Z"
+```
+
+Nonce/timestamp invalidos o repetidos: `409` estandarizado.
+
+### E. Endpoint con JWE (header-based verifier)
+
+Opcion 1:
+
+```bash
+curl -i "$API_BASE_URL/v1/hotels/secure" \
+  -H "Content-Type: application/jose" \
+  --data '<jwe-compact-payload>'
+```
+
+Opcion 2:
+
+```bash
+curl -i "$API_BASE_URL/v1/hotels/secure" \
+  -H "X-JWE: 1" \
+  --data '{}'
+```
+
+Si no cumple: `401`.
+
+### F. Endpoint con CBT
+
+```bash
+curl -i "$API_BASE_URL/v1/hotels/secure" \
+  -H "X-Token-Binding: abc123" \
+  -H "X-Client-Cert-SHA256: abc123"
+```
+
+Si no coincide binding/cert: `401`.
+
+### G. Endpoint con Attestation
+
+```bash
+curl -i "$API_BASE_URL/v1/hotels/secure" \
+  -H "X-Aula-Attestation: <attestation_token>"
+```
+
+Sin token de attestation: `403`.
+
+### H. Endpoint con Hardware-backed key proof
+
+```bash
+curl -i "$API_BASE_URL/v1/hotels/secure" \
+  -H "X-Aula-Key-Id: hk_2026_01" \
+  -H "X-Aula-Signature: <signature>" \
+  -H "X-Aula-Alg: ES256"
+```
+
+Fallo de verificacion: `401`.
+
+### I. Endpoint con Enclave attestation flag
+
+```bash
+curl -i "$API_BASE_URL/v1/hotels/secure" \
+  -H "X-Enclave-Attested: true"
+```
+
+Si no esta atestiguado: `409`.
+
+### J. ETag (cache condicional)
+
+Primer request:
+
+```bash
+curl -i "$API_BASE_URL/v1/hotels"
+```
+
+Reutilizar ETag en condicional:
+
+```bash
+curl -i "$API_BASE_URL/v1/hotels" \
+  -H 'If-None-Match: W/"flow-v1"'
+```
+
+Si no cambio: `304` sin body.
+
+### K. Rate limit normalizado
+
+Cuando el upstream/rate-limiter devuelve `429`, `normalize_rate_limit_errors()` retorna contrato estandar:
+
+```json
+{
+  "error": {
+    "code": "RATE_LIMITED",
+    "message": "Too many requests. Please retry later."
+  },
+  "meta": {
+    "status": 429,
+    "timestamp": "...",
+    "request_id": "...",
+    "path": "..."
+  }
+}
+```
+
+Y preserva headers:
+
+- `Retry-After`
+- `x-ratelimit-*`
+
+## 13) Ejemplo handler final (hotel list)
+
+```rust
+use actix_web::{web, HttpResponse};
+use sentinelkit_actix::{AppError, Response, ResponseContext, SentinelContext};
+
+#[derive(Clone)]
+pub struct AppStateService {
+    pub default_page_size: u32,
+}
+
+pub async fn list_hotels(
+    ctx: SentinelContext,
+    state: web::Data<AppStateService>,
+) -> Result<HttpResponse, AppError> {
+
+    let hotels = vec![
+        serde_json::json!({\"id\":\"htl_1\",\"name\":\"Hotel Aurora\",\"city\":\"Bogota\"}),
+        serde_json::json!({\"id\":\"htl_2\",\"name\":\"Hotel Pacific\",\"city\":\"Cali\"}),
+    ];
+
+    Ok(Response::ok_paginated_with(
+        hotels,
+        1,
+        state.default_page_size,
+        42,
+        ResponseContext {
+            request_id: ctx.request_id(),
+            path: ctx.path(),
+        },
+    ))
+}
 ```

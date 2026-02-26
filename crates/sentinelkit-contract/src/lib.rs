@@ -2,7 +2,7 @@ use actix_web::http::{StatusCode, header::ETAG};
 use actix_web::{HttpResponse, ResponseError};
 use chrono::Utc;
 use serde::ser::Serializer;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +131,100 @@ pub struct PaginationMeta {
     pub page_size: u32,
     pub total_items: u64,
     pub total_pages: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PaginationQuery {
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+    pub sort: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaginationConfig {
+    pub default_page: u32,
+    pub default_page_size: u32,
+    pub max_page_size: u32,
+}
+
+impl Default for PaginationConfig {
+    fn default() -> Self {
+        Self {
+            default_page: 1,
+            default_page_size: 20,
+            max_page_size: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaginationNormalized {
+    pub page: u32,
+    pub page_size: u32,
+    pub offset: u64,
+    pub sort: String,
+}
+
+pub fn normalize_pagination_query(
+    query: PaginationQuery,
+    cfg: PaginationConfig,
+    allowed_sorts: &[&str],
+) -> Result<PaginationNormalized, AppError> {
+    let page = query.page.unwrap_or(cfg.default_page);
+    if page == 0 {
+        return Err(
+            AppError::validation()
+                .with_i18n(I18nKey::ErrorsValidationError)
+                .with_detail(detail(
+                    "page",
+                    ErrorCode::OutOfRange,
+                    Some(I18nKey::ErrorsOutOfRange),
+                )),
+        );
+    }
+
+    let requested_page_size = query.page_size.unwrap_or(cfg.default_page_size);
+    if requested_page_size == 0 {
+        return Err(
+            AppError::validation()
+                .with_i18n(I18nKey::ErrorsValidationError)
+                .with_detail(detail(
+                    "page_size",
+                    ErrorCode::OutOfRange,
+                    Some(I18nKey::ErrorsOutOfRange),
+                )),
+        );
+    }
+    let page_size = requested_page_size.min(cfg.max_page_size);
+
+    let sort = query.sort.unwrap_or_else(|| {
+        allowed_sorts
+            .first()
+            .copied()
+            .unwrap_or("created_at_desc")
+            .to_string()
+    });
+
+    if !allowed_sorts.is_empty() && !allowed_sorts.iter().any(|s| *s == sort) {
+        return Err(
+            AppError::validation()
+                .with_i18n(I18nKey::ErrorsValidationError)
+                .with_detail(detail(
+                    "sort",
+                    ErrorCode::InvalidFormat,
+                    Some(I18nKey::ErrorsInvalidFormat),
+                )),
+        );
+    }
+
+    let offset = (page.saturating_sub(1) as u64).saturating_mul(page_size as u64);
+
+    Ok(PaginationNormalized {
+        page,
+        page_size,
+        offset,
+        sort,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -510,5 +604,54 @@ mod tests {
             ));
         let res = err.error_response();
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn normalize_pagination_query_uses_defaults() {
+        let q = PaginationQuery {
+            page: None,
+            page_size: None,
+            sort: None,
+        };
+        let n = normalize_pagination_query(
+            q,
+            PaginationConfig::default(),
+            &["created_at_desc", "name_asc"],
+        )
+        .expect("normalized");
+        assert_eq!(n.page, 1);
+        assert_eq!(n.page_size, 20);
+        assert_eq!(n.offset, 0);
+        assert_eq!(n.sort, "created_at_desc");
+    }
+
+    #[test]
+    fn normalize_pagination_query_caps_page_size() {
+        let q = PaginationQuery {
+            page: Some(2),
+            page_size: Some(500),
+            sort: Some("name_asc".to_string()),
+        };
+        let n = normalize_pagination_query(
+            q,
+            PaginationConfig::default(),
+            &["created_at_desc", "name_asc"],
+        )
+        .expect("normalized");
+        assert_eq!(n.page_size, 100);
+        assert_eq!(n.offset, 100);
+    }
+
+    #[test]
+    fn normalize_pagination_query_rejects_invalid_sort() {
+        let q = PaginationQuery {
+            page: Some(1),
+            page_size: Some(20),
+            sort: Some("drop_table".to_string()),
+        };
+        let err =
+            normalize_pagination_query(q, PaginationConfig::default(), &["created_at_desc"])
+                .expect_err("must fail");
+        assert_eq!(err.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

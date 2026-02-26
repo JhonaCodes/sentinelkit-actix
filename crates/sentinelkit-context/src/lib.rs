@@ -1,9 +1,10 @@
-use actix_web::Error;
+use actix_web::dev::Payload;
+use actix_web::{Error, FromRequest, HttpRequest};
 use actix_web::HttpMessage;
 use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready};
 use actix_web::http::header::{HeaderName, HeaderValue};
 use chrono::Utc;
-use futures_util::future::{LocalBoxFuture, Ready, ok};
+use futures_util::future::{LocalBoxFuture, Ready, ok, ready};
 use serde::Serialize;
 use std::rc::Rc;
 use uuid::Uuid;
@@ -13,6 +14,33 @@ pub struct RequestContext {
     pub request_id: String,
     pub started_at: String,
     pub path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SentinelContext(pub RequestContext);
+
+impl SentinelContext {
+    pub fn request_id(&self) -> &str {
+        &self.0.request_id
+    }
+
+    pub fn path(&self) -> &str {
+        &self.0.path
+    }
+}
+
+impl FromRequest for SentinelContext {
+    type Error = Error;
+    type Future = Ready<Result<Self, Self::Error>>;
+
+    fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Self::Future {
+        match req.extensions().get::<RequestContext>().cloned() {
+            Some(ctx) => ready(Ok(SentinelContext(ctx))),
+            None => ready(Err(actix_web::error::ErrorInternalServerError(
+                "RequestContext not found. Did you forget .wrap(context())?",
+            ))),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -118,5 +146,28 @@ mod tests {
         let res = test::call_service(&app, req).await;
         assert_eq!(res.status(), actix_web::http::StatusCode::OK);
         assert!(res.headers().contains_key("x-request-id"));
+    }
+
+    async fn extractor_handler(ctx: SentinelContext, state: web::Data<i32>) -> HttpResponse {
+        if ctx.request_id().starts_with("req_") && *state.get_ref() == 7 {
+            HttpResponse::Ok().finish()
+        } else {
+            HttpResponse::InternalServerError().finish()
+        }
+    }
+
+    #[actix_web::test]
+    async fn sentinel_context_extractor_works_with_data() {
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(7))
+                .wrap(context())
+                .route("/x", web::get().to(extractor_handler)),
+        )
+        .await;
+
+        let req = test::TestRequest::get().uri("/x").to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(res.status(), actix_web::http::StatusCode::OK);
     }
 }

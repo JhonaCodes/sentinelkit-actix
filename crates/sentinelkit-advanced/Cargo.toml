@@ -8,3 +8,6 @@ license.workspace = true
 actix-web.workspace = true
 futures-util.workspace = true
 sentinelkit-contract = { path = "../sentinelkit-contract" }
+serde.workspace = true
+serde_json.workspace = true
+jsonwebtoken = "9"

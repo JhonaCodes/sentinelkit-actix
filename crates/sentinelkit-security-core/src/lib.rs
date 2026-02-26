@@ -2,9 +2,16 @@ use actix_web::body::EitherBody;
 use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready};
 use actix_web::http::header::{HeaderName, HeaderValue};
 use actix_web::{Error, ResponseError};
+use chrono::{DateTime, Utc};
 use futures_util::future::{LocalBoxFuture, Ready, ok};
+use hmac::{Hmac, Mac};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use redis::{Client as RedisClient, Connection as RedisConnection};
+use serde::Deserialize;
 use sentinelkit_contract::AppError;
+use sha2::Sha256;
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::sync::Arc;
 
 pub trait AuthVerifier: Send + Sync + 'static {
@@ -30,6 +37,44 @@ pub trait AntiReplayStore: Send + Sync + 'static {
     fn verify_nonce_and_timestamp(&self, req: &ServiceRequest) -> bool;
 }
 
+#[derive(Debug, Clone)]
+pub struct JwtHs256Config {
+    pub secret: String,
+    pub issuer: String,
+    pub audience: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct HmacSigningConfig {
+    pub secret: String,
+    pub timestamp_window_secs: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AntiReplayConfig {
+    pub timestamp_window_secs: i64,
+}
+
+impl Default for AntiReplayConfig {
+    fn default() -> Self {
+        Self {
+            timestamp_window_secs: 300,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct JwtStdClaims {
+    #[serde(rename = "exp")]
+    _exp: usize,
+    #[allow(dead_code)]
+    iat: Option<usize>,
+    #[serde(rename = "iss")]
+    _iss: String,
+    #[serde(rename = "aud")]
+    _aud: serde_json::Value,
+}
+
 fn request_id(req: &ServiceRequest) -> String {
     req.headers()
         .get("x-request-id")
@@ -38,7 +83,7 @@ fn request_id(req: &ServiceRequest) -> String {
         .to_string()
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SecurityHeadersPolicy {
     pub hsts: &'static str,
     pub x_content_type_options: &'static str,
@@ -428,6 +473,215 @@ impl AntiReplayStore for AllowAllAntiReplay {
     }
 }
 
+pub struct JwtHs256AuthVerifier {
+    cfg: JwtHs256Config,
+}
+
+impl JwtHs256AuthVerifier {
+    pub fn new(cfg: JwtHs256Config) -> Self {
+        Self { cfg }
+    }
+}
+
+impl AuthVerifier for JwtHs256AuthVerifier {
+    fn verify(&self, req: &ServiceRequest) -> bool {
+        let token = match req
+            .headers()
+            .get("authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+        {
+            Some(t) if !t.trim().is_empty() => t,
+            _ => return false,
+        };
+
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_issuer(&[self.cfg.issuer.as_str()]);
+        validation.set_audience(&[self.cfg.audience.as_str()]);
+        validation.validate_exp = true;
+
+        decode::<JwtStdClaims>(
+            token,
+            &DecodingKey::from_secret(self.cfg.secret.as_bytes()),
+            &validation,
+        )
+        .is_ok()
+    }
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+pub struct HmacRequestSigner {
+    cfg: HmacSigningConfig,
+}
+
+impl HmacRequestSigner {
+    pub fn new(cfg: HmacSigningConfig) -> Self {
+        Self { cfg }
+    }
+}
+
+impl RequestSigner for HmacRequestSigner {
+    fn verify_signature(&self, req: &ServiceRequest) -> bool {
+        let signature = match req
+            .headers()
+            .get("x-aula-signature")
+            .and_then(|h| h.to_str().ok())
+        {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => return false,
+        };
+
+        let timestamp = match req
+            .headers()
+            .get("x-aula-timestamp")
+            .and_then(|h| h.to_str().ok())
+        {
+            Some(t) => t,
+            _ => return false,
+        };
+
+        let dt = match DateTime::parse_from_rfc3339(timestamp) {
+            Ok(v) => v.with_timezone(&Utc),
+            Err(_) => return false,
+        };
+        let skew = (Utc::now() - dt).num_seconds().abs();
+        if skew > self.cfg.timestamp_window_secs {
+            return false;
+        }
+
+        let canonical = format!("{}\n{}\n{}", req.method(), req.path(), timestamp);
+        let mut mac = match HmacSha256::new_from_slice(self.cfg.secret.as_bytes()) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        mac.update(canonical.as_bytes());
+        let expected_hex = hex::encode(mac.finalize().into_bytes());
+
+        subtle::ConstantTimeEq::ct_eq(expected_hex.as_bytes(), signature.as_bytes()).into()
+    }
+}
+
+pub struct InMemoryAntiReplayStore {
+    cfg: AntiReplayConfig,
+    nonces: Mutex<std::collections::HashMap<String, i64>>,
+}
+
+impl InMemoryAntiReplayStore {
+    pub fn new(cfg: AntiReplayConfig) -> Self {
+        Self {
+            cfg,
+            nonces: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl AntiReplayStore for InMemoryAntiReplayStore {
+    fn verify_nonce_and_timestamp(&self, req: &ServiceRequest) -> bool {
+        let nonce = match req
+            .headers()
+            .get("x-aula-nonce")
+            .and_then(|h| h.to_str().ok())
+        {
+            Some(v) if !v.trim().is_empty() => v.to_string(),
+            _ => return false,
+        };
+        let timestamp = match req
+            .headers()
+            .get("x-aula-timestamp")
+            .and_then(|h| h.to_str().ok())
+        {
+            Some(v) => v,
+            _ => return false,
+        };
+
+        let ts = match DateTime::parse_from_rfc3339(timestamp) {
+            Ok(v) => v.with_timezone(&Utc).timestamp(),
+            Err(_) => return false,
+        };
+        let now = Utc::now().timestamp();
+        if (now - ts).abs() > self.cfg.timestamp_window_secs {
+            return false;
+        }
+
+        let mut guard = match self.nonces.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        let min_valid = now - self.cfg.timestamp_window_secs;
+        guard.retain(|_, seen_at| *seen_at >= min_valid);
+
+        if guard.contains_key(&nonce) {
+            return false;
+        }
+        guard.insert(nonce, now);
+        true
+    }
+}
+
+pub struct RedisAntiReplayStore {
+    cfg: AntiReplayConfig,
+    conn: Mutex<RedisConnection>,
+}
+
+impl RedisAntiReplayStore {
+    pub fn new(redis_url: &str, cfg: AntiReplayConfig) -> Result<Self, redis::RedisError> {
+        let client = RedisClient::open(redis_url)?;
+        let conn = client.get_connection()?;
+        Ok(Self {
+            cfg,
+            conn: Mutex::new(conn),
+        })
+    }
+}
+
+impl AntiReplayStore for RedisAntiReplayStore {
+    fn verify_nonce_and_timestamp(&self, req: &ServiceRequest) -> bool {
+        let nonce = match req
+            .headers()
+            .get("x-aula-nonce")
+            .and_then(|h| h.to_str().ok())
+        {
+            Some(v) if !v.trim().is_empty() => v.to_string(),
+            _ => return false,
+        };
+        let timestamp = match req
+            .headers()
+            .get("x-aula-timestamp")
+            .and_then(|h| h.to_str().ok())
+        {
+            Some(v) => v,
+            _ => return false,
+        };
+
+        let ts = match DateTime::parse_from_rfc3339(timestamp) {
+            Ok(v) => v.with_timezone(&Utc).timestamp(),
+            Err(_) => return false,
+        };
+        let now = Utc::now().timestamp();
+        if (now - ts).abs() > self.cfg.timestamp_window_secs {
+            return false;
+        }
+
+        let key = format!("sentinelkit:nonce:{nonce}");
+        let mut conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(p) => p.into_inner(),
+        };
+
+        let result: redis::RedisResult<Option<String>> = redis::cmd("SET")
+            .arg(&key)
+            .arg("1")
+            .arg("EX")
+            .arg(self.cfg.timestamp_window_secs)
+            .arg("NX")
+            .query(&mut *conn);
+
+        matches!(result, Ok(Some(ref ok)) if ok == "OK")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,5 +770,31 @@ mod tests {
         let req = test::TestRequest::get().uri("/x").to_request();
         let res = test::call_service(&app, req).await;
         assert_eq!(res.status(), actix_web::http::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn hmac_signer_rejects_missing_headers() {
+        let signer = HmacRequestSigner::new(HmacSigningConfig {
+            secret: "secret".to_string(),
+            timestamp_window_secs: 300,
+        });
+        let req = actix_web::test::TestRequest::get().to_srv_request();
+        assert!(!signer.verify_signature(&req));
+    }
+
+    #[test]
+    fn in_memory_anti_replay_rejects_reused_nonce() {
+        let store = InMemoryAntiReplayStore::new(AntiReplayConfig::default());
+        let ts = Utc::now().to_rfc3339();
+        let req1 = actix_web::test::TestRequest::get()
+            .insert_header(("x-aula-nonce", "abc"))
+            .insert_header(("x-aula-timestamp", ts.clone()))
+            .to_srv_request();
+        let req2 = actix_web::test::TestRequest::get()
+            .insert_header(("x-aula-nonce", "abc"))
+            .insert_header(("x-aula-timestamp", ts))
+            .to_srv_request();
+        assert!(store.verify_nonce_and_timestamp(&req1));
+        assert!(!store.verify_nonce_and_timestamp(&req2));
     }
 }
