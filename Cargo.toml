@@ -1,0 +1,26 @@
+[workspace]
+members = [
+  "crates/sentinelkit-actix",
+  "crates/sentinelkit-contract",
+  "crates/sentinelkit-context",
+  "crates/sentinelkit-policy",
+  "crates/sentinelkit-cache",
+  "crates/sentinelkit-security-core",
+  "crates/sentinelkit-advanced",
+  "crates/sentinelkit-rate-limit-actix",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+authors = ["AulaMas"]
+
+[workspace.dependencies]
+actix-web = "4.11.0"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+futures-util = "0.3"

@@ -1,0 +1,16 @@
+[package]
+name = "sentinelkit-rate-limit-actix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+actix-web.workspace = true
+futures-util.workspace = true
+sentinelkit-contract = { path = "../sentinelkit-contract" }
+rate_limiter = { git = "https://github.com/JhonaCodes/rate-limiter", optional = true }
+
+[features]
+default = []
+# This feature is reserved for integrating github.com/JhonaCodes/rate-limiter
+rate-limiter-backend = ["dep:rate_limiter"]

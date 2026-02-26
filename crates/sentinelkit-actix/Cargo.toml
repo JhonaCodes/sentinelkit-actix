@@ -1,0 +1,23 @@
+[package]
+name = "sentinelkit-actix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sentinelkit-contract = { path = "../sentinelkit-contract" }
+sentinelkit-context = { path = "../sentinelkit-context" }
+sentinelkit-policy = { path = "../sentinelkit-policy" }
+sentinelkit-cache = { path = "../sentinelkit-cache" }
+sentinelkit-security-core = { path = "../sentinelkit-security-core" }
+sentinelkit-advanced = { path = "../sentinelkit-advanced" }
+sentinelkit-rate-limit-actix = { path = "../sentinelkit-rate-limit-actix" }
+
+[features]
+default = []
+rate-limiter-backend = ["sentinelkit-rate-limit-actix/rate-limiter-backend"]
+
+[dev-dependencies]
+actix-web.workspace = true
+serde_json.workspace = true
+sentinelkit-advanced = { path = "../sentinelkit-advanced" }
